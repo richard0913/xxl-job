@@ -1,135 +1,193 @@
 package com.xxl.job.core.executor;
 
-import com.xxl.job.core.biz.ExecutorBiz;
-import com.xxl.job.core.biz.impl.ExecutorBizImpl;
+import com.xxl.job.core.biz.AdminBiz;
+import com.xxl.job.core.biz.client.AdminBizClient;
 import com.xxl.job.core.handler.IJobHandler;
-import com.xxl.job.core.handler.annotation.JobHander;
-import com.xxl.job.core.rpc.netcom.NetComServerFactory;
-import com.xxl.job.core.thread.ExecutorRegistryThread;
+import com.xxl.job.core.log.XxlJobFileAppender;
+import com.xxl.job.core.server.EmbedServer;
+import com.xxl.job.core.thread.JobLogFileCleanThread;
 import com.xxl.job.core.thread.JobThread;
 import com.xxl.job.core.thread.TriggerCallbackThread;
-import com.xxl.job.core.util.AdminApiUtil;
+import com.xxl.job.core.util.IpUtil;
+import com.xxl.job.core.util.NetUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.BeansException;
-import org.springframework.context.ApplicationContext;
-import org.springframework.context.ApplicationContextAware;
-import org.springframework.context.ApplicationEvent;
-import org.springframework.context.ApplicationListener;
-import org.springframework.context.event.ContextClosedEvent;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 /**
  * Created by xuxueli on 2016/3/2 21:14.
  */
-public class XxlJobExecutor implements ApplicationContextAware, ApplicationListener {
+public class XxlJobExecutor  {
     private static final Logger logger = LoggerFactory.getLogger(XxlJobExecutor.class);
 
-    private String ip;
-    private int port = 9999;
-    private String appName;
+    // ---------------------- param ----------------------
     private String adminAddresses;
-    public static String logPath;
+    private String accessToken;
+    private String appname;
+    private String address;
+    private String ip;
+    private int port;
+    private String logPath;
+    private int logRetentionDays;
 
+    public void setAdminAddresses(String adminAddresses) {
+        this.adminAddresses = adminAddresses;
+    }
+    public void setAccessToken(String accessToken) {
+        this.accessToken = accessToken;
+    }
+    public void setAppname(String appname) {
+        this.appname = appname;
+    }
+    public void setAddress(String address) {
+        this.address = address;
+    }
     public void setIp(String ip) {
         this.ip = ip;
     }
     public void setPort(int port) {
         this.port = port;
     }
-    public void setAppName(String appName) {
-        this.appName = appName;
-    }
-    public void setAdminAddresses(String adminAddresses) {
-        this.adminAddresses = adminAddresses;
-    }
     public void setLogPath(String logPath) {
         this.logPath = logPath;
     }
+    public void setLogRetentionDays(int logRetentionDays) {
+        this.logRetentionDays = logRetentionDays;
+    }
 
-    // ---------------------------------- job server ------------------------------------
-    private NetComServerFactory serverFactory = new NetComServerFactory();
+
+    // ---------------------- start + stop ----------------------
     public void start() throws Exception {
-        // admin api util init
-        AdminApiUtil.init(adminAddresses);
 
-        // executor start
-        NetComServerFactory.putService(ExecutorBiz.class, new ExecutorBizImpl());
-        serverFactory.start(port, ip, appName);
+        // init logpath
+        XxlJobFileAppender.initLogPath(logPath);
 
-        // trigger callback thread start
+        // init invoker, admin-client
+        initAdminBizList(adminAddresses, accessToken);
+
+
+        // init JobLogFileCleanThread
+        JobLogFileCleanThread.getInstance().start(logRetentionDays);
+
+        // init TriggerCallbackThread
         TriggerCallbackThread.getInstance().start();
+
+        // init executor-server
+        initEmbedServer(address, ip, port, appname, accessToken);
     }
     public void destroy(){
-        // 1、executor registry thread stop
-        ExecutorRegistryThread.getInstance().toStop();
+        // destory executor-server
+        stopEmbedServer();
 
-        // 2、executor stop
-        serverFactory.destroy();
-
-        // 3、job thread repository destory
-        if (JobThreadRepository.size() > 0) {
-            for (Map.Entry<Integer, JobThread> item: JobThreadRepository.entrySet()) {
-                JobThread jobThread = item.getValue();
-                jobThread.toStop("Web容器销毁终止");
-                jobThread.interrupt();
-
+        // destory jobThreadRepository
+        if (jobThreadRepository.size() > 0) {
+            for (Map.Entry<Integer, JobThread> item: jobThreadRepository.entrySet()) {
+                JobThread oldJobThread = removeJobThread(item.getKey(), "web container destroy and kill the job.");
+                // wait for job thread push result to callback queue
+                if (oldJobThread != null) {
+                    try {
+                        oldJobThread.join();
+                    } catch (InterruptedException e) {
+                        logger.error(">>>>>>>>>>> xxl-job, JobThread destroy(join) error, jobId:{}", item.getKey(), e);
+                    }
+                }
             }
-            JobThreadRepository.clear();
+            jobThreadRepository.clear();
         }
+        jobHandlerRepository.clear();
 
-        // 4、trigger callback thread stop
+
+        // destory JobLogFileCleanThread
+        JobLogFileCleanThread.getInstance().toStop();
+
+        // destory TriggerCallbackThread
         TriggerCallbackThread.getInstance().toStop();
+
     }
 
-    // ---------------------------------- init job handler ------------------------------------
-    public static ApplicationContext applicationContext;
-	@Override
-	public void setApplicationContext(ApplicationContext applicationContext) throws BeansException {
-        XxlJobExecutor.applicationContext = applicationContext;
 
-        // init job handler action
-        Map<String, Object> serviceBeanMap = applicationContext.getBeansWithAnnotation(JobHander.class);
+    // ---------------------- admin-client (rpc invoker) ----------------------
+    private static List<AdminBiz> adminBizList;
+    private void initAdminBizList(String adminAddresses, String accessToken) throws Exception {
+        if (adminAddresses!=null && adminAddresses.trim().length()>0) {
+            for (String address: adminAddresses.trim().split(",")) {
+                if (address!=null && address.trim().length()>0) {
 
-        if (serviceBeanMap!=null && serviceBeanMap.size()>0) {
-            for (Object serviceBean : serviceBeanMap.values()) {
-                if (serviceBean instanceof IJobHandler){
-                    String name = serviceBean.getClass().getAnnotation(JobHander.class).value();
-                    IJobHandler handler = (IJobHandler) serviceBean;
-                    registJobHandler(name, handler);
+                    AdminBiz adminBiz = new AdminBizClient(address.trim(), accessToken);
+
+                    if (adminBizList == null) {
+                        adminBizList = new ArrayList<AdminBiz>();
+                    }
+                    adminBizList.add(adminBiz);
                 }
             }
         }
-	}
+    }
+    public static List<AdminBiz> getAdminBizList(){
+        return adminBizList;
+    }
 
-    // ---------------------------------- destory job executor ------------------------------------
-    @Override
-    public void onApplicationEvent(ApplicationEvent applicationEvent) {
-        if(applicationEvent instanceof ContextClosedEvent){
-            // TODO
+    // ---------------------- executor-server (rpc provider) ----------------------
+    private EmbedServer embedServer = null;
+
+    private void initEmbedServer(String address, String ip, int port, String appname, String accessToken) throws Exception {
+
+        // fill ip port
+        port = port>0?port: NetUtil.findAvailablePort(9999);
+        ip = (ip!=null&&ip.trim().length()>0)?ip: IpUtil.getIp();
+
+        // generate address
+        if (address==null || address.trim().length()==0) {
+            String ip_port_address = IpUtil.getIpPort(ip, port);   // registry-address：default use address to registry , otherwise use ip:port if address is null
+            address = "http://{ip_port}/".replace("{ip_port}", ip_port_address);
+        }
+
+        // accessToken
+        if (accessToken==null || accessToken.trim().length()==0) {
+            logger.warn(">>>>>>>>>>> xxl-job accessToken is empty. To ensure system security, please set the accessToken.");
+        }
+
+        // start
+        embedServer = new EmbedServer();
+        embedServer.start(address, port, appname, accessToken);
+    }
+
+    private void stopEmbedServer() {
+        // stop provider factory
+        if (embedServer != null) {
+            try {
+                embedServer.stop();
+            } catch (Exception e) {
+                logger.error(e.getMessage(), e);
+            }
         }
     }
 
-    // ---------------------------------- job handler repository
-    private static ConcurrentHashMap<String, IJobHandler> jobHandlerRepository = new ConcurrentHashMap<String, IJobHandler>();
-    public static IJobHandler registJobHandler(String name, IJobHandler jobHandler){
-        logger.info("xxl-job register jobhandler success, name:{}, jobHandler:{}", name, jobHandler);
-        return jobHandlerRepository.put(name, jobHandler);
-    }
+
+    // ---------------------- job handler repository ----------------------
+    private static ConcurrentMap<String, IJobHandler> jobHandlerRepository = new ConcurrentHashMap<String, IJobHandler>();
     public static IJobHandler loadJobHandler(String name){
         return jobHandlerRepository.get(name);
     }
+    public static IJobHandler registJobHandler(String name, IJobHandler jobHandler){
+        logger.info(">>>>>>>>>>> xxl-job register jobhandler success, name:{}, jobHandler:{}", name, jobHandler);
+        return jobHandlerRepository.put(name, jobHandler);
+    }
 
-    // ---------------------------------- job thread repository
-    private static ConcurrentHashMap<Integer, JobThread> JobThreadRepository = new ConcurrentHashMap<Integer, JobThread>();
+
+    // ---------------------- job thread repository ----------------------
+    private static ConcurrentMap<Integer, JobThread> jobThreadRepository = new ConcurrentHashMap<Integer, JobThread>();
     public static JobThread registJobThread(int jobId, IJobHandler handler, String removeOldReason){
-        JobThread newJobThread = new JobThread(handler);
+        JobThread newJobThread = new JobThread(jobId, handler);
         newJobThread.start();
         logger.info(">>>>>>>>>>> xxl-job regist JobThread success, jobId:{}, handler:{}", new Object[]{jobId, handler});
 
-        JobThread oldJobThread = JobThreadRepository.put(jobId, newJobThread);	// putIfAbsent | oh my god, map's put method return the old value!!!
+        JobThread oldJobThread = jobThreadRepository.put(jobId, newJobThread);	// putIfAbsent | oh my god, map's put method return the old value!!!
         if (oldJobThread != null) {
             oldJobThread.toStop(removeOldReason);
             oldJobThread.interrupt();
@@ -137,15 +195,18 @@ public class XxlJobExecutor implements ApplicationContextAware, ApplicationListe
 
         return newJobThread;
     }
-    public static void removeJobThread(int jobId, String removeOldReason){
-        JobThread oldJobThread = JobThreadRepository.remove(jobId);
+    public static JobThread removeJobThread(int jobId, String removeOldReason){
+        JobThread oldJobThread = jobThreadRepository.remove(jobId);
         if (oldJobThread != null) {
             oldJobThread.toStop(removeOldReason);
             oldJobThread.interrupt();
+
+            return oldJobThread;
         }
+        return null;
     }
     public static JobThread loadJobThread(int jobId){
-        JobThread jobThread = JobThreadRepository.get(jobId);
+        JobThread jobThread = jobThreadRepository.get(jobId);
         return jobThread;
     }
 

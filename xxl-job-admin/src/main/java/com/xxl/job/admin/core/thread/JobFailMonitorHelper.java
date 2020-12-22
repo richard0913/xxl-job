@@ -1,22 +1,19 @@
 package com.xxl.job.admin.core.thread;
 
-import com.xxl.job.admin.core.model.XxlJobGroup;
+import com.xxl.job.admin.core.conf.XxlJobAdminConfig;
 import com.xxl.job.admin.core.model.XxlJobInfo;
 import com.xxl.job.admin.core.model.XxlJobLog;
-import com.xxl.job.admin.core.schedule.XxlJobDynamicScheduler;
-import com.xxl.job.admin.core.util.MailUtil;
-import com.xxl.job.core.biz.model.ReturnT;
+import com.xxl.job.admin.core.trigger.TriggerTypeEnum;
+import com.xxl.job.admin.core.util.I18nUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.text.MessageFormat;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.Set;
-import java.util.concurrent.*;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * job monitor instance
+ *
  * @author xuxueli 2015-9-1 18:05:56
  */
 public class JobFailMonitorHelper {
@@ -27,68 +24,87 @@ public class JobFailMonitorHelper {
 		return instance;
 	}
 
-	private LinkedBlockingQueue<Integer> queue = new LinkedBlockingQueue<Integer>(0xfff8);
+	// ---------------------- monitor ----------------------
 
 	private Thread monitorThread;
-	private boolean toStop = false;
+	private volatile boolean toStop = false;
 	public void start(){
 		monitorThread = new Thread(new Runnable() {
 
 			@Override
 			public void run() {
+
+				// monitor
 				while (!toStop) {
 					try {
-						logger.debug(">>>>>>>>>>> job monitor beat ... ");
-						Integer jobLogId = JobFailMonitorHelper.instance.queue.take();
-						if (jobLogId != null && jobLogId > 0) {
-							logger.debug(">>>>>>>>>>> job monitor heat success, JobLogId:{}", jobLogId);
-							XxlJobLog log = XxlJobDynamicScheduler.xxlJobLogDao.load(jobLogId);
-							if (log!=null) {
-								if (ReturnT.SUCCESS_CODE==log.getTriggerCode() && log.getHandleCode()==0) {
-									// running
-									try {
-										TimeUnit.SECONDS.sleep(10);
-									} catch (InterruptedException e) {
-										e.printStackTrace();
-									}
-									JobFailMonitorHelper.monitor(jobLogId);
-								}
-								if (ReturnT.SUCCESS_CODE==log.getTriggerCode() && ReturnT.SUCCESS_CODE==log.getHandleCode()) {
-									// pass
-								}
-								if (ReturnT.FAIL_CODE == log.getTriggerCode()|| ReturnT.FAIL_CODE==log.getHandleCode()) {
-									XxlJobInfo info = XxlJobDynamicScheduler.xxlJobInfoDao.loadById(log.getJobId());
-									if (info!=null && info.getAlarmEmail()!=null && info.getAlarmEmail().trim().length()>0) {
 
-										Set<String> emailSet = new HashSet<String>(Arrays.asList(info.getAlarmEmail().split(",")));
-										for (String email: emailSet) {
-											String title = "《调度监控报警》(任务调度中心XXL-JOB)";
-											XxlJobGroup group = XxlJobDynamicScheduler.xxlJobGroupDao.load(Integer.valueOf(info.getJobGroup()));
-											String content = MessageFormat.format("任务调度失败, 执行器名称:{0}, 任务描述:{1}.", group!=null?group.getTitle():"null", info.getJobDesc());
-											MailUtil.sendMail(email, title, content, false, null);
-										}
-									}
+						List<Long> failLogIds = XxlJobAdminConfig.getAdminConfig().getXxlJobLogDao().findFailJobLogIds(1000);
+						if (failLogIds!=null && !failLogIds.isEmpty()) {
+							for (long failLogId: failLogIds) {
+
+								// lock log
+								int lockRet = XxlJobAdminConfig.getAdminConfig().getXxlJobLogDao().updateAlarmStatus(failLogId, 0, -1);
+								if (lockRet < 1) {
+									continue;
 								}
+								XxlJobLog log = XxlJobAdminConfig.getAdminConfig().getXxlJobLogDao().load(failLogId);
+								XxlJobInfo info = XxlJobAdminConfig.getAdminConfig().getXxlJobInfoDao().loadById(log.getJobId());
+
+								// 1、fail retry monitor
+								if (log.getExecutorFailRetryCount() > 0) {
+									JobTriggerPoolHelper.trigger(log.getJobId(), TriggerTypeEnum.RETRY, (log.getExecutorFailRetryCount()-1), log.getExecutorShardingParam(), log.getExecutorParam(), null);
+									String retryMsg = "<br><br><span style=\"color:#F39C12;\" > >>>>>>>>>>>"+ I18nUtil.getString("jobconf_trigger_type_retry") +"<<<<<<<<<<< </span><br>";
+									log.setTriggerMsg(log.getTriggerMsg() + retryMsg);
+									XxlJobAdminConfig.getAdminConfig().getXxlJobLogDao().updateTriggerInfo(log);
+								}
+
+								// 2、fail alarm monitor
+								int newAlarmStatus = 0;		// 告警状态：0-默认、-1=锁定状态、1-无需告警、2-告警成功、3-告警失败
+								if (info!=null && info.getAlarmEmail()!=null && info.getAlarmEmail().trim().length()>0) {
+									boolean alarmResult = XxlJobAdminConfig.getAdminConfig().getJobAlarmer().alarm(info, log);
+									newAlarmStatus = alarmResult?2:3;
+								} else {
+									newAlarmStatus = 1;
+								}
+
+								XxlJobAdminConfig.getAdminConfig().getXxlJobLogDao().updateAlarmStatus(failLogId, -1, newAlarmStatus);
 							}
 						}
+
 					} catch (Exception e) {
-						logger.error("job monitor error:{}", e);
+						if (!toStop) {
+							logger.error(">>>>>>>>>>> xxl-job, job fail monitor thread error:{}", e);
+						}
 					}
-				}
+
+                    try {
+                        TimeUnit.SECONDS.sleep(10);
+                    } catch (Exception e) {
+                        if (!toStop) {
+                            logger.error(e.getMessage(), e);
+                        }
+                    }
+
+                }
+
+				logger.info(">>>>>>>>>>> xxl-job, job fail monitor thread stop");
+
 			}
 		});
 		monitorThread.setDaemon(true);
+		monitorThread.setName("xxl-job, admin JobFailMonitorHelper");
 		monitorThread.start();
 	}
 
 	public void toStop(){
 		toStop = true;
-		//monitorThread.interrupt();
+		// interrupt and wait
+		monitorThread.interrupt();
+		try {
+			monitorThread.join();
+		} catch (InterruptedException e) {
+			logger.error(e.getMessage(), e);
+		}
 	}
-	
-	// producer
-	public static void monitor(int jobLogId){
-		getInstance().queue.offer(jobLogId);
-	}
-	
+
 }
